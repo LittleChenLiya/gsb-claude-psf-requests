@@ -5,6 +5,12 @@ dev
 ---
 
 - \[Short description of non-trivial change.\]
+- `HTTPAdapter` now gives every request its own copy of the configured
+  `Retry` object, so concurrent requests sharing a `Session` never share
+  mutable retry state. Requests with a streaming (non-rewindable) body are
+  no longer eligible for read/status/redirect retries that would require
+  re-sending the body; only connection-establishment failures are retried
+  for them.
 
 
 2.34.2 (2026-05-14)

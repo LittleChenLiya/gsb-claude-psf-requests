@@ -1050,6 +1050,31 @@ backoff, within a Requests :class:`Session <requests.Session>` using the
     )
     s.mount('https://', HTTPAdapter(max_retries=retries))
 
+Retries follow these rules:
+
+* Only connection-establishment failures (DNS, socket connect, and connect
+  timeouts), responses whose status code is in ``status_forcelist``, and
+  idempotent HTTP methods are retried automatically. ``allowed_methods``
+  defaults to the idempotent methods (``GET``, ``HEAD``, ``OPTIONS``,
+  ``TRACE``, ``PUT``, ``DELETE``), so ``POST`` and other non-idempotent
+  methods are never re-sent unless you explicitly opt in as above.
+* Requests with a streaming (non-rewindable) body, such as a generator or a
+  non-seekable file object, are never re-sent. For those, only
+  connection-establishment failures are retried, since the connection was
+  never established and no body bytes were transmitted.
+* A ``Retry-After`` response header, in either seconds or HTTP-date format,
+  is honored when ``respect_retry_after_header`` is enabled (the default).
+  The wait is capped by ``retry_after_max``, and exponential backoff
+  (``backoff_factor``) is capped by ``backoff_max``.
+* When retries are exhausted, the last response is returned if
+  ``raise_on_status`` is ``False``; otherwise a
+  :class:`~requests.exceptions.RetryError` is raised, chained from the
+  underlying urllib3 ``MaxRetryError``. Responses from failed attempts are
+  always closed before the next attempt, so connections are not leaked.
+* Each request uses its own copy of the retry configuration, so concurrent
+  requests sharing one ``Session`` or adapter never share mutable retry
+  state.
+
 .. _`urllib3`: https://github.com/urllib3/urllib3
 .. _`urllib3.util.Retry`: https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html#urllib3.util.Retry
 

@@ -82,6 +82,25 @@ DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
 
 
+def _is_rewindable_body(body: Any) -> bool:
+    """Return True if *body* can be safely re-sent after a failed attempt.
+
+    In-memory bodies (bytes/str) and seekable file-like objects can be
+    rewound, so urllib3 may resend them. Generators, iterators, and
+    non-seekable streams are consumed as they are read and must never be
+    re-sent automatically.
+    """
+    if body is None or isinstance(body, (bytes, str)):
+        return True
+    seekable = getattr(body, "seekable", None)
+    if callable(seekable):
+        try:
+            return bool(seekable())
+        except OSError:
+            return False
+    return hasattr(body, "seek") and hasattr(body, "tell")
+
+
 def _urllib3_request_context(
     request: PreparedRequest,
     verify: bool | str | None,
@@ -173,6 +192,25 @@ class HTTPAdapter(BaseAdapter):
         which we retry a request, import urllib3's ``Retry`` class and pass
         that instead.
     :param pool_block: Whether the connection pool should block for connections.
+
+    Retries follow these rules:
+
+    * Only connection-establishment failures, responses with a status code
+      in the configured ``status_forcelist``, and idempotent HTTP methods
+      (those in ``Retry.allowed_methods``, which defaults to the idempotent
+      methods) are retried automatically.
+    * Requests with a streaming (non-rewindable) body are never re-sent;
+      only connection-establishment failures are retried for them.
+    * ``Retry-After`` response headers (in seconds or HTTP-date format) are
+      honored and capped by ``Retry.retry_after_max``; exponential backoff
+      is capped by ``Retry.backoff_max``.
+    * When retries are exhausted, the last response is returned if
+      ``raise_on_status`` is False; otherwise a
+      :class:`RetryError <requests.exceptions.RetryError>` is raised with
+      the underlying urllib3 exception as its context.
+    * Each request uses its own copy of the retry configuration, so
+      concurrent requests sharing one adapter or Session never share
+      mutable retry state.
 
     Usage::
 
@@ -678,6 +716,24 @@ class HTTPAdapter(BaseAdapter):
 
         chunked = not (request.body is None or "Content-Length" in request.headers)
 
+        # Each request gets its own copy of the retry configuration so that
+        # concurrent requests sharing this adapter (e.g. via a Session used
+        # from multiple threads) never share mutable retry state.
+        retries = self.max_retries.new()
+
+        if not _is_rewindable_body(request.body):
+            # A streaming (non-rewindable) body cannot be re-sent, so only
+            # connection-establishment failures may be retried; read, status,
+            # and redirect retries would require resending the body.
+            retries = retries.new(
+                read=False,
+                status=0,
+                status_forcelist=(),
+                redirect=0,
+                other=0,
+                respect_retry_after_header=False,
+            )
+
         if isinstance(timeout, tuple):
             try:
                 connect, read = timeout
@@ -702,7 +758,7 @@ class HTTPAdapter(BaseAdapter):
                 assert_same_host=False,
                 preload_content=False,
                 decode_content=False,
-                retries=self.max_retries,
+                retries=retries,
                 timeout=resolved_timeout,
                 chunked=chunked,
             )
