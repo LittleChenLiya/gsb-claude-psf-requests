@@ -4,7 +4,15 @@ Release History
 dev
 ---
 
-- \[Short description of non-trivial change.\]
+- Reworked the HTTPAdapter retry policy: automatic retries now only happen
+  for idempotent methods with rewindable (non-streaming) bodies, and only
+  on connection-establishment failures or retryable 5xx responses.
+  Retry-After headers are honored in both delta-seconds and HTTP-date
+  forms and are capped, together with the exponential backoff, by
+  Retry.backoff_max. When retries are exhausted the raised RetryError
+  keeps the last response, connection failures preserve the original
+  exception chain, and retry state is tracked per request so concurrent
+  requests on one Session never share mutable retry state.
 
 
 2.34.2 (2026-05-14)

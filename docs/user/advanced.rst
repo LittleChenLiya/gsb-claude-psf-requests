@@ -1046,9 +1046,38 @@ backoff, within a Requests :class:`Session <requests.Session>` using the
         total=3,
         backoff_factor=0.1,
         status_forcelist=[502, 503, 504],
-        allowed_methods={'POST'},
     )
     s.mount('https://', HTTPAdapter(max_retries=retries))
+
+Requests only retries a request automatically when it is safe to send it
+again:
+
+* the request method is idempotent (GET, HEAD, OPTIONS, TRACE, PUT or
+  DELETE) — non-idempotent methods such as POST are never re-sent;
+* the request body is rewindable — streaming bodies (generators, iterators
+  and non-seekable file objects) are never re-sent;
+* the failure happened before a connection was established (DNS errors,
+  refused or timed-out connections), or the server responded with a
+  retryable 5xx status code (500, 502, 503 and 504 unless
+  ``status_forcelist`` says otherwise). Read timeouts and other errors
+  raised after the request reached the server are never retried.
+
+``Retry-After`` response headers are honored in both delta-seconds and
+HTTP-date forms and, like the exponential backoff, are capped by
+``Retry.backoff_max`` (120 seconds by default), so a single wait never
+exceeds the total backoff budget.
+
+When retries are exhausted, the raised
+:exc:`~requests.exceptions.RetryError` keeps the last received response on
+its ``response`` attribute, and connection failures surface as
+:exc:`~requests.exceptions.ConnectionError` with the original urllib3
+error preserved in the exception chain (``__cause__``). Responses discarded
+for a retry are drained and closed, so connections and response bodies are
+not leaked.
+
+Retry bookkeeping is maintained per request: concurrent requests sharing
+one :class:`Session <requests.Session>` never share mutable retry state,
+so a single session can safely be used from multiple threads.
 
 .. _`urllib3`: https://github.com/urllib3/urllib3
 .. _`urllib3.util.Retry`: https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html#urllib3.util.Retry

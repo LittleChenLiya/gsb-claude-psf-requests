@@ -10,19 +10,20 @@ from __future__ import annotations
 
 import os.path
 import socket  # noqa: F401
+import time
 import typing
 import warnings
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from urllib3.exceptions import (
     ClosedPoolError,
     ConnectTimeoutError,
     LocationValueError,
-    MaxRetryError,
     NewConnectionError,
     ProtocolError,
     ReadTimeoutError,
-    ResponseError,
 )
 from urllib3.exceptions import HTTPError as _HTTPError
 from urllib3.exceptions import InvalidHeader as _InvalidHeader
@@ -80,6 +81,185 @@ DEFAULT_POOLBLOCK = False
 DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
+
+#: HTTP methods that are safe to retry automatically. Non-idempotent
+#: methods (e.g. POST, PATCH) are never re-sent by the retry policy.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"})
+
+#: 5xx status codes that are retried when retries are enabled and the
+#: configured ``Retry`` object does not define its own ``status_forcelist``.
+DEFAULT_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+#: Upper bound, in seconds, applied both to ``Retry-After`` hints and to the
+#: computed exponential backoff, so a single retry never sleeps longer.
+DEFAULT_BACKOFF_MAX = Retry.DEFAULT_BACKOFF_MAX
+
+
+def _parse_retry_after(value: str, backoff_max: float) -> float | None:
+    """Parse a ``Retry-After`` header value into a delay in seconds.
+
+    Both delta-seconds and HTTP-date formats are supported. The result is
+    clamped to ``[0, backoff_max]`` so a server-provided hint can never
+    exceed the total backoff budget. Returns ``None`` when the value
+    cannot be parsed.
+    """
+    value = value.strip()
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at is None:
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(delay, backoff_max))
+
+
+def _is_rewindable_body(body: Any) -> bool:
+    """Return True if a request body can be re-sent after a failure.
+
+    Streaming bodies (generators, iterators, non-seekable file objects)
+    cannot be replayed, so requests carrying them must never be retried.
+    """
+    if body is None or isinstance(body, (str, bytes)):
+        return True
+    tell = getattr(body, "tell", None)
+    seek = getattr(body, "seek", None)
+    if tell is None or seek is None:
+        return False
+    try:
+        tell()
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _close_response_quietly(resp: Any) -> None:
+    """Drain and close a response that is being discarded for a retry.
+
+    Draining returns the underlying connection to the pool when possible;
+    closing guarantees neither the connection nor the response body leaks.
+    """
+    try:
+        resp.drain_conn()
+    except (OSError, _HTTPError):
+        pass
+    try:
+        resp.close()
+    except (OSError, _HTTPError):
+        pass
+
+
+class _RetryState:
+    """Per-request retry state derived from an adapter-level ``Retry``.
+
+    A fresh instance is created inside every
+    :meth:`HTTPAdapter.send` call and all mutable counters live on it, so
+    concurrent requests sharing one ``Session`` never share mutable retry
+    state. The adapter's ``Retry`` object itself is only ever read.
+    """
+
+    def __init__(self, retries: Retry, request: PreparedRequest) -> None:
+        allowed_methods = retries.allowed_methods
+        method = (request.method or "").upper()
+        self.method_retryable = method in IDEMPOTENT_METHODS and (
+            allowed_methods is None or method in allowed_methods
+        )
+        self.body_retryable = _is_rewindable_body(request.body)
+        self.retryable = self.method_retryable and self.body_retryable
+
+        self._total = retries.total
+        self._connect = retries.connect
+        self._status = retries.status
+        if retries.status_forcelist:
+            self.status_forcelist = frozenset(retries.status_forcelist)
+        elif self._has_budget(retries.total) or self._has_budget(
+            retries.status if retries.status is not None else retries.total
+        ):
+            # Retries are enabled without an explicit forcelist: fall back
+            # to the default set of retryable 5xx codes. With retries
+            # disabled (the default), responses are returned as-is.
+            self.status_forcelist = DEFAULT_RETRYABLE_STATUS_CODES
+        else:
+            self.status_forcelist = frozenset()
+        self.backoff_factor = retries.backoff_factor or 0.0
+        backoff_max = getattr(retries, "backoff_max", None)
+        self.backoff_max = (
+            backoff_max if backoff_max is not None else DEFAULT_BACKOFF_MAX
+        )
+        self.respect_retry_after = bool(retries.respect_retry_after_header)
+        self.raise_on_status = bool(retries.raise_on_status)
+        self._errors = 0
+
+        body = request.body
+        self._body = None
+        self._body_pos = None
+        if body is not None and hasattr(body, "seek") and hasattr(body, "tell"):
+            try:
+                self._body_pos = body.tell()
+                self._body = body
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _has_budget(count: int | None) -> bool:
+        return count is None or count > 0
+
+    def can_retry_connect(self) -> bool:
+        return (
+            self.retryable
+            and self._has_budget(self._total)
+            and self._has_budget(self._connect)
+        )
+
+    def is_retryable_status(self, status: int) -> bool:
+        return self.retryable and status in self.status_forcelist
+
+    def can_retry_status(self, status: int) -> bool:
+        return (
+            self.is_retryable_status(status)
+            and self._has_budget(self._total)
+            and self._has_budget(self._status)
+        )
+
+    def increment_connect(self) -> None:
+        if self._total is not None:
+            self._total -= 1
+        if self._connect is not None:
+            self._connect -= 1
+        self._errors += 1
+
+    def increment_status(self) -> None:
+        if self._total is not None:
+            self._total -= 1
+        if self._status is not None:
+            self._status -= 1
+        self._errors += 1
+
+    def rewind_body(self) -> None:
+        if self._body is not None and self._body_pos is not None:
+            try:
+                self._body.seek(self._body_pos)
+            except (OSError, ValueError):
+                pass
+
+    def backoff_delay(self) -> float:
+        # Mirror urllib3: no backoff before the first retry, then
+        # exponential growth bounded by the total backoff cap.
+        if self._errors <= 1:
+            return 0.0
+        return min(self.backoff_factor * (2 ** (self._errors - 1)), self.backoff_max)
+
+    def retry_delay(self, retry_after: str | None = None) -> float:
+        if retry_after and self.respect_retry_after:
+            parsed = _parse_retry_after(retry_after, self.backoff_max)
+            if parsed is not None:
+                return parsed
+        return self.backoff_delay()
 
 
 def _urllib3_request_context(
@@ -172,6 +352,17 @@ class HTTPAdapter(BaseAdapter):
         connections. If you need granular control over the conditions under
         which we retry a request, import urllib3's ``Retry`` class and pass
         that instead.
+
+        Automatic retries are only ever attempted for idempotent methods
+        (GET, HEAD, OPTIONS, TRACE, PUT, DELETE) carrying a rewindable
+        (non-streaming) body, and only when the connection could not be
+        established or the server returned a retryable 5xx status code
+        (see ``DEFAULT_RETRYABLE_STATUS_CODES``). ``Retry-After`` response
+        headers, in either delta-seconds or HTTP-date form, are honored
+        and clamped together with the exponential backoff to
+        ``Retry.backoff_max``. Retry bookkeeping is kept per request, so
+        concurrent requests sharing one adapter never share mutable retry
+        state.
     :param pool_block: Whether the connection pool should block for connections.
 
     Usage::
@@ -692,57 +883,83 @@ class HTTPAdapter(BaseAdapter):
         else:
             resolved_timeout = TimeoutSauce(connect=timeout, read=timeout)
 
-        try:
-            resp = conn.urlopen(
-                method=request.method,
-                url=url,
-                body=request.body,  # type: ignore[arg-type]  # urllib3 stubs don't accept Iterable[bytes | str]
-                headers=request.headers,  # type: ignore[arg-type]  # urllib3#3072
-                redirect=False,
-                assert_same_host=False,
-                preload_content=False,
-                decode_content=False,
-                retries=self.max_retries,
-                timeout=resolved_timeout,
-                chunked=chunked,
-            )
+        # Fresh per-request retry state: urllib3 is told not to retry
+        # (retries=False) so the policy below is the single place where
+        # retries are decided, and concurrent requests on this adapter
+        # never share mutable retry state.
+        retry_state = _RetryState(self.max_retries, request)
 
-        except (ProtocolError, OSError) as err:
-            raise ConnectionError(err, request=request)
+        while True:
+            try:
+                resp = conn.urlopen(
+                    method=request.method,
+                    url=url,
+                    body=request.body,  # type: ignore[arg-type]  # urllib3 stubs don't accept Iterable[bytes | str]
+                    headers=request.headers,  # type: ignore[arg-type]  # urllib3#3072
+                    redirect=False,
+                    assert_same_host=False,
+                    preload_content=False,
+                    decode_content=False,
+                    retries=False,
+                    timeout=resolved_timeout,
+                    chunked=chunked,
+                )
 
-        except MaxRetryError as e:
-            if isinstance(e.reason, ConnectTimeoutError):
-                # TODO: Remove this in 3.0.0: see #2811
-                if not isinstance(e.reason, NewConnectionError):
-                    raise ConnectTimeout(e, request=request)
+            except (NewConnectionError, ConnectTimeoutError) as err:
+                # The connection was never established, so the request was
+                # not sent; retrying is safe for retryable requests.
+                if retry_state.can_retry_connect():
+                    retry_state.increment_connect()
+                    delay = retry_state.retry_delay()
+                    retry_state.rewind_body()
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                if isinstance(err, ConnectTimeoutError) and not isinstance(
+                    err, NewConnectionError
+                ):
+                    raise ConnectTimeout(err, request=request) from err
+                raise ConnectionError(err, request=request) from err
 
-            if isinstance(e.reason, ResponseError):
-                raise RetryError(e, request=request)
+            except (ProtocolError, OSError) as err:
+                raise ConnectionError(err, request=request) from err
 
-            if isinstance(e.reason, _ProxyError):
-                raise ProxyError(e, request=request)
+            except ClosedPoolError as err:
+                raise ConnectionError(err, request=request) from err
 
-            if isinstance(e.reason, _SSLError):
-                # This branch is for urllib3 v1.22 and later.
-                raise SSLError(e, request=request)
+            except _ProxyError as err:
+                raise ProxyError(err) from err
 
-            raise ConnectionError(e, request=request)
+            except (_SSLError, _HTTPError) as err:
+                if isinstance(err, _SSLError):
+                    raise SSLError(err, request=request) from err
+                elif isinstance(err, ReadTimeoutError):
+                    raise ReadTimeout(err, request=request) from err
+                elif isinstance(err, _InvalidHeader):
+                    raise InvalidHeader(err, request=request) from err
+                else:
+                    raise
 
-        except ClosedPoolError as e:
-            raise ConnectionError(e, request=request)
+            if retry_state.is_retryable_status(resp.status):
+                if retry_state.can_retry_status(resp.status):
+                    retry_state.increment_status()
+                    delay = retry_state.retry_delay(resp.headers.get("Retry-After"))
+                    # Discard the failed response without leaking its body
+                    # or connection before re-sending the request.
+                    _close_response_quietly(resp)
+                    retry_state.rewind_body()
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                if retry_state.raise_on_status:
+                    # Retries are exhausted: keep the last response on the
+                    # raised error so callers can still inspect it.
+                    response = self.build_response(request, resp)
+                    raise RetryError(
+                        f"Max retries exceeded with url: {url} "
+                        f"(too many {resp.status} error responses)",
+                        request=request,
+                        response=response,
+                    )
 
-        except _ProxyError as e:
-            raise ProxyError(e)
-
-        except (_SSLError, _HTTPError) as e:
-            if isinstance(e, _SSLError):
-                # This branch is for urllib3 versions earlier than v1.22
-                raise SSLError(e, request=request)
-            elif isinstance(e, ReadTimeoutError):
-                raise ReadTimeout(e, request=request)
-            elif isinstance(e, _InvalidHeader):
-                raise InvalidHeader(e, request=request)
-            else:
-                raise
-
-        return self.build_response(request, resp)
+            return self.build_response(request, resp)
