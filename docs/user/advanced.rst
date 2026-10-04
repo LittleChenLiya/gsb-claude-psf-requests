@@ -82,6 +82,45 @@ exited, even if unhandled exceptions occurred.
 All values that are contained within a session are directly available to you.
 See the :ref:`Session API Docs <sessionapi>` to learn more.
 
+.. _trusted-redirect-sessions:
+
+Restricting Cookies Across Redirects
+------------------------------------
+
+By default, a :class:`Session <requests.Session>` lets its cookie jar attach
+any matching cookie to every redirect follow-up request, even when the
+redirect crosses to a different host. If you need stricter control, use
+:class:`requests.TrustedRedirectSession`, an opt-in subclass that scopes
+cookies to a trusted set of hosts during redirect chains::
+
+    s = requests.TrustedRedirectSession(trusted_hosts=["b.test"])
+    s.get("http://a.test/start")  # redirects to b.test keep their cookies
+
+The policy is:
+
+* The first request of a chain is prepared exactly like a regular session
+  request; the caller may attach any cookies.
+* Every follow-up hop is checked against the trusted-host set of the
+  **original** target: a hop is trusted when its host matches the original
+  request host (ports are ignored, mirroring cookie scoping rules) or is
+  listed in ``trusted_hosts`` (case-insensitive).
+* For an untrusted hop, the ``Cookie`` header is removed *and* the cookie jar
+  is not consulted, so it cannot re-attach cookies for the new host — even if
+  the jar already holds cookies for it. Cookies received in responses are
+  still stored in the jar for later same-origin use.
+* For a trusted hop, cookies are attached following the usual domain and path
+  matching rules. Redirecting back to the original host is always allowed.
+* The existing ``Authorization`` stripping behavior on cross-host redirects
+  is unchanged.
+
+Each redirect hop that is actually sent appends one entry to
+``session.cookie_redirect_audit`` containing only the target host and the
+decision (``"allow"`` or ``"deny"``); cookie names and values are never
+recorded::
+
+    >>> s.cookie_redirect_audit
+    [{'host': 'b.test', 'decision': 'allow'}]
+
 .. _request-and-response-objects:
 
 Request and Response Objects

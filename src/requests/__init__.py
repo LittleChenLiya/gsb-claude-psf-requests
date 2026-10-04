@@ -182,7 +182,7 @@ from .exceptions import (
     URLRequired,
 )
 from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
+from .sessions import Session, TrustedRedirectSession, session
 from .status_codes import codes
 
 __all__ = (
@@ -198,6 +198,7 @@ __all__ = (
     "Session",
     "Timeout",
     "TooManyRedirects",
+    "TrustedRedirectSession",
     "URLRequired",
     "codes",
     "delete",

@@ -46,6 +46,9 @@ Request Sessions
 .. autoclass:: Session
    :inherited-members:
 
+.. autoclass:: TrustedRedirectSession
+   :inherited-members:
+
 
 Lower-Level Classes
 -------------------

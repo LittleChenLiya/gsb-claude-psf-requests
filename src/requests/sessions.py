@@ -257,16 +257,7 @@ class SessionRedirectMixin:
                     prepared_request.headers.pop(header, None)
                 prepared_request.body = None
 
-            headers = prepared_request.headers
-            headers.pop("Cookie", None)
-
-            # Extract any cookies sent on the response to the cookiejar
-            # in the new request. Because we've mutated our copied prepared
-            # request, use the old one that we haven't yet touched.
-            cookie_jar = cast("CookieJar", prepared_request._cookies)
-            extract_cookies_to_jar(cookie_jar, req, resp.raw)
-            merge_cookies(cookie_jar, self.cookies)
-            prepared_request.prepare_cookies(cookie_jar)
+            self._rebuild_cookies(prepared_request, req, resp)
 
             # Rebuild auth and proxy information.
             proxies = self.rebuild_proxies(prepared_request, proxies)
@@ -276,7 +267,8 @@ class SessionRedirectMixin:
             # value ensures `rewindable` will be True, allowing us to raise an
             # UnrewindableBodyError, instead of hanging the connection.
             rewindable = prepared_request._body_position is not None and (
-                "Content-Length" in headers or "Transfer-Encoding" in headers
+                "Content-Length" in prepared_request.headers
+                or "Transfer-Encoding" in prepared_request.headers
             )
 
             # Attempt to rewind consumed file-like object.
@@ -305,6 +297,29 @@ class SessionRedirectMixin:
                 # extract redirect url, if any, for the next loop
                 url = self.get_redirect_target(resp)
                 yield resp
+
+    def _rebuild_cookies(
+        self, prepared_request: PreparedRequest, req: PreparedRequest, resp: Response
+    ) -> None:
+        """Rebuild the ``Cookie`` header of a redirect follow-up request.
+
+        The default implementation reproduces the historic behavior: any
+        cookies set by the redirect response are extracted into the request's
+        cookie jar, the session cookies are merged in, and the jar is allowed
+        to (re-)attach every cookie matching the new URL. Subclasses may
+        override this hook to restrict which cookies are carried across
+        redirects without touching the rest of the redirect machinery.
+        """
+        headers = prepared_request.headers
+        headers.pop("Cookie", None)
+
+        # Extract any cookies sent on the response to the cookiejar
+        # in the new request. Because we've mutated our copied prepared
+        # request, use the old one that we haven't yet touched.
+        cookie_jar = cast("CookieJar", prepared_request._cookies)
+        extract_cookies_to_jar(cookie_jar, req, resp.raw)
+        merge_cookies(cookie_jar, self.cookies)
+        prepared_request.prepare_cookies(cookie_jar)
 
     def rebuild_auth(
         self, prepared_request: PreparedRequest, response: Response
@@ -903,6 +918,120 @@ class Session(SessionRedirectMixin):
     def __setstate__(self, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(self, attr, value)
+
+
+class TrustedRedirectSession(Session):
+    """A :class:`Session` subclass that restricts how cookies are carried
+    across redirects.
+
+    Policy
+    ------
+    * The *first* request of a redirect chain is prepared exactly like a
+      regular :class:`Session` request: the caller may attach any cookies
+      (via the ``cookies`` argument, headers, or the session jar).
+    * Every *follow-up* hop is checked against the trusted-host set of the
+      **original** target. A hop is trusted when its host matches the host of
+      the original request URL, or when its host is listed in
+      ``trusted_hosts`` (case-insensitive, matched by hostname; ports are
+      ignored, mirroring cookie scoping rules).
+    * When a hop is **not** trusted, the ``Cookie`` header is removed from
+      the outgoing request *and* the cookie jar is not allowed to re-attach
+      cookies for that hop — even if the jar already holds cookies for the
+      new host. Cookies extracted from responses are still stored in the
+      session jar for later, same-origin use.
+    * When a hop is trusted, cookies are attached by the jar following the
+      usual domain and path matching rules.
+    * Redirecting back to the original host is always judged against the
+      original trust set, so returning to the origin keeps its cookies.
+    * The existing ``Authorization`` stripping logic
+      (:meth:`SessionRedirectMixin.rebuild_auth`) is untouched.
+
+    Every redirect hop appends one entry to :attr:`cookie_redirect_audit`
+    containing only the target host and the decision (``"allow"`` or
+    ``"deny"``); cookie names and values are never recorded.
+
+    :param trusted_hosts: iterable of additional hostnames (besides the
+        original request host) that are allowed to receive cookies when a
+        redirect chain crosses to them.
+    """
+
+    __attrs__: list[str] = Session.__attrs__ + [
+        "trusted_hosts",
+        "cookie_redirect_audit",
+    ]
+
+    def __init__(self, trusted_hosts: Any = ()) -> None:
+        super().__init__()
+        self.trusted_hosts: frozenset[str] = frozenset(
+            str(host).lower() for host in trusted_hosts
+        )
+        #: Audit trail of redirect cookie decisions. Each entry is a dict
+        #: with only ``host`` and ``decision`` keys -- never cookie values.
+        self.cookie_redirect_audit: list[dict[str, str]] = []
+
+    @staticmethod
+    def _redirect_origin_host(resp: Response) -> str | None:
+        """Return the hostname of the first request in the redirect chain."""
+        if resp.history:
+            original_request = resp.history[0].request
+        else:
+            original_request = resp.request
+        if original_request is None or original_request.url is None:
+            return None
+        return urlparse(original_request.url).hostname
+
+    def _is_trusted_redirect_host(
+        self, origin_host: str | None, new_host: str | None
+    ) -> bool:
+        if new_host is None:
+            return False
+        new_host = new_host.lower()
+        if origin_host is not None and new_host == origin_host.lower():
+            return True
+        return new_host in self.trusted_hosts
+
+    def _rebuild_cookies(
+        self, prepared_request: PreparedRequest, req: PreparedRequest, resp: Response
+    ) -> None:
+        headers = prepared_request.headers
+        headers.pop("Cookie", None)
+
+        # Extract any cookies sent on the response to the cookiejar
+        # in the new request. Because we've mutated our copied prepared
+        # request, use the old one that we haven't yet touched.
+        cookie_jar = cast("CookieJar", prepared_request._cookies)
+        extract_cookies_to_jar(cookie_jar, req, resp.raw)
+        merge_cookies(cookie_jar, self.cookies)
+
+        origin_host = self._redirect_origin_host(resp)
+        new_host = urlparse(prepared_request.url).hostname
+
+        if self._is_trusted_redirect_host(origin_host, new_host):
+            prepared_request.prepare_cookies(cookie_jar)
+            decision = "allow"
+        else:
+            # Untrusted hop: the Cookie header stays removed and the jar is
+            # deliberately not consulted, so it cannot re-attach cookies for
+            # the new host.
+            decision = "deny"
+
+        # Record the decision on the request itself; it is appended to the
+        # audit trail by :meth:`send` only when the request is actually sent.
+        # (``Session.send`` also runs this hook once per hop while computing
+        # ``Response.next``, and that dry-run request is never sent.)
+        prepared_request._redirect_cookie_decision = {  # type: ignore[attr-defined]
+            "host": new_host or "",
+            "decision": decision,
+        }
+
+    def send(self, request: PreparedRequest, **kwargs: Any) -> Response:
+        response = super().send(request, **kwargs)
+        decision = getattr(request, "_redirect_cookie_decision", None)
+        # Only redirect follow-up requests carry a decision marker, and only
+        # the sends issued by the redirect loop use ``allow_redirects=False``.
+        if decision is not None and not kwargs.get("allow_redirects", True):
+            self.cookie_redirect_audit.append(decision)
+        return response
 
 
 def session() -> Session:
