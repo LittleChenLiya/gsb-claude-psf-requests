@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from collections import OrderedDict
-from collections.abc import Generator, Mapping, MutableMapping
+from collections.abc import Generator, Iterable, Mapping, MutableMapping
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -257,20 +257,19 @@ class SessionRedirectMixin:
                     prepared_request.headers.pop(header, None)
                 prepared_request.body = None
 
-            headers = prepared_request.headers
-            headers.pop("Cookie", None)
-
-            # Extract any cookies sent on the response to the cookiejar
-            # in the new request. Because we've mutated our copied prepared
-            # request, use the old one that we haven't yet touched.
-            cookie_jar = cast("CookieJar", prepared_request._cookies)
-            extract_cookies_to_jar(cookie_jar, req, resp.raw)
-            merge_cookies(cookie_jar, self.cookies)
-            prepared_request.prepare_cookies(cookie_jar)
+            # Rebuild the Cookie header for the new hop. The default
+            # implementation preserves the historical behavior; subclasses
+            # such as TrustedCookieSession override it to scope which hosts
+            # may receive cookies across redirects.
+            self.rebuild_cookies(
+                prepared_request, req, resp, yield_requests=yield_requests
+            )
 
             # Rebuild auth and proxy information.
             proxies = self.rebuild_proxies(prepared_request, proxies)
             self.rebuild_auth(prepared_request, resp)
+
+            headers = prepared_request.headers
 
             # A failed tell() sets `_body_position` to `object()`. This non-None
             # value ensures `rewindable` will be True, allowing us to raise an
@@ -305,6 +304,41 @@ class SessionRedirectMixin:
                 # extract redirect url, if any, for the next loop
                 url = self.get_redirect_target(resp)
                 yield resp
+
+    def rebuild_cookies(
+        self,
+        prepared_request: PreparedRequest,
+        req: PreparedRequest,
+        resp: Response,
+        yield_requests: bool = False,
+    ) -> None:
+        """Rebuild the ``Cookie`` header for a redirected request.
+
+        The previous hop's ``Cookie`` header is removed, cookies carried by
+        the redirect response are extracted into the cookie jar, the
+        session's cookies are merged in, and a new ``Cookie`` header is
+        generated from the jar for the target URL.
+
+        This is the hook used by :class:`TrustedCookieSession` to filter
+        which hosts may receive cookies across redirects. The default
+        implementation preserves the historical behavior of
+        :meth:`Session.resolve_redirects`.
+
+        :param yield_requests: when ``True`` the rebuilt request is only
+            used for :attr:`Response.next` inspection and is not sent;
+            subclasses may use this to avoid recording duplicate audit
+            entries.
+        """
+        headers = prepared_request.headers
+        headers.pop("Cookie", None)
+
+        # Extract any cookies sent on the response to the cookiejar
+        # in the new request. Because we've mutated our copied prepared
+        # request, use the old one that we haven't yet touched.
+        cookie_jar = cast("CookieJar", prepared_request._cookies)
+        extract_cookies_to_jar(cookie_jar, req, resp.raw)
+        merge_cookies(cookie_jar, self.cookies)
+        prepared_request.prepare_cookies(cookie_jar)
 
     def rebuild_auth(
         self, prepared_request: PreparedRequest, response: Response
@@ -903,6 +937,177 @@ class Session(SessionRedirectMixin):
     def __setstate__(self, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(self, attr, value)
+
+
+def _normalize_trust_host(host: Any) -> str:
+    """Normalize a host entry for trust matching (lowercase, stripped)."""
+    return str(host).strip().lower()
+
+
+def _hostname_from_netloc(netloc: str) -> str:
+    """Extract the hostname (without port) from a netloc.
+
+    Handles IPv6 literals (``[::1]:8000``) and userinfo (``user@host``).
+    """
+    netloc = netloc.strip().lower()
+    if netloc.startswith("["):
+        # IPv6 literal: [::1]:8000 -> ::1
+        return netloc[1:].split("]", 1)[0]
+    return netloc.rsplit("@", 1)[-1].split(":", 1)[0]
+
+
+def _host_matches_trust(netloc: str, trust_entry: str) -> bool:
+    """Match a target netloc against a single trusted-host entry.
+
+    A trust entry without a port matches the hostname on any port; an entry
+    with a port matches only that exact host:port.
+    """
+    netloc = netloc.lower()
+    trust_entry = trust_entry.lower().strip()
+    if netloc == trust_entry:
+        return True
+    return _hostname_from_netloc(netloc) == trust_entry
+
+
+class TrustedCookieSession(Session):
+    """A :class:`Session` that restricts which hosts may receive cookies
+    when following redirects.
+
+    The first hop of every request always carries the cookies the caller
+    supplied. On each subsequent redirect hop the target host is checked
+    against the session's trusted-host set; cookies are only sent when the
+    host is trusted. When a redirect crosses to an untrusted host the
+    ``Cookie`` header is removed and the cookie jar is prevented from
+    generating a replacement for that hop. Cookies that belong to a
+    trusted host are still matched using the standard domain and path
+    rules, so a redirect back to a trusted origin only sends cookies that
+    legitimately belong there.
+
+    The trusted-host set for a redirect chain is seeded from the original
+    target of the request (its host is always trusted) and can be extended
+    with ``trusted_hosts``. Hosts are matched by hostname, so a port
+    change on the same host stays trusted while a different host is
+    blocked.
+
+    Decisions are appended to :attr:`cookie_audit` as dictionaries with
+    only ``host`` and ``decision`` keys; cookie values are never recorded.
+
+    Policy summary:
+
+    * First hop: caller-supplied cookies are always sent (``allow``).
+    * Redirect hop to a trusted host: cookies are sent per the standard
+      domain and path rules (``allow``).
+    * Redirect hop to an untrusted host: the ``Cookie`` header is stripped
+      and the cookie jar must not replenish it (``deny``).
+    * The existing ``Authorization`` stripping logic is untouched.
+
+    :param trusted_hosts: optional iterable of hostnames (or ``host:port``
+        strings) that are trusted to receive cookies across redirects.
+    """
+
+    __attrs__ = Session.__attrs__ + [
+        "_trusted_hosts",
+        "_chain_trust",
+        "cookie_audit",
+    ]
+
+    def __init__(
+        self,
+        trusted_hosts: Iterable[str] | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._trusted_hosts: set[str] = set()
+        if trusted_hosts:
+            for host in trusted_hosts:
+                self._trusted_hosts.add(_normalize_trust_host(host))
+        #: The active trust set for the current redirect chain. It is
+        #: seeded from the original target of each request and augmented
+        #: with the explicit ``trusted_hosts``.
+        self._chain_trust: set[str] = set(self._trusted_hosts)
+        #: Audit trail of cookie decisions per hop. Each entry is a dict
+        #: with ``host`` (the target netloc) and ``decision`` (``"allow"``
+        #: or ``"deny"``). Cookie values are never recorded.
+        self.cookie_audit: list[dict[str, str]] = []
+
+    def trust(self, host: str) -> None:
+        """Add a host (or ``host:port``) to the trusted-host set."""
+        self._trusted_hosts.add(_normalize_trust_host(host))
+
+    def untrust(self, host: str) -> None:
+        """Remove a host (or ``host:port``) from the trusted-host set."""
+        self._trusted_hosts.discard(_normalize_trust_host(host))
+
+    @property
+    def trusted_hosts(self) -> frozenset[str]:
+        """The explicit trusted-host set (read-only snapshot)."""
+        return frozenset(self._trusted_hosts)
+
+    def _seed_chain_trust(self, url: str) -> None:
+        """Seed the chain trust set from the original target URL."""
+        parsed = urlparse(url)
+        netloc = _normalize_trust_host(parsed.netloc)
+        hostname = _hostname_from_netloc(netloc)
+        chain = set(self._trusted_hosts)
+        if netloc:
+            chain.add(netloc)
+        if hostname:
+            chain.add(hostname)
+        self._chain_trust = chain
+
+    def _is_trusted_host(self, netloc: str) -> bool:
+        """Return ``True`` if the target netloc is trusted for cookies."""
+        netloc = netloc.lower()
+        for entry in self._chain_trust:
+            if _host_matches_trust(netloc, entry):
+                return True
+        return False
+
+    def send(self, request: PreparedRequest, **kwargs: Any) -> Response:
+        """Send a given PreparedRequest, seeding trust for the first hop."""
+        allow_redirects = kwargs.get("allow_redirects", True)
+        if allow_redirects:
+            url = request.url
+            if isinstance(url, bytes):
+                url = url.decode("utf-8")
+            self._seed_chain_trust(url)
+            netloc = _normalize_trust_host(urlparse(url).netloc)
+            self.cookie_audit.append({"host": netloc, "decision": "allow"})
+        return super().send(request, **kwargs)
+
+    def rebuild_cookies(
+        self,
+        prepared_request: PreparedRequest,
+        req: PreparedRequest,
+        resp: Response,
+        yield_requests: bool = False,
+    ) -> None:
+        """Rebuild cookies for a redirect hop, filtering by trusted host.
+
+        Untrusted hops get their ``Cookie`` header stripped and the cookie
+        jar is not allowed to replenish it. Trusted hops behave exactly
+        like the base session (domain/path matching).
+        """
+        netloc = _normalize_trust_host(urlparse(prepared_request.url).netloc)
+        trusted = self._is_trusted_host(netloc)
+        if not yield_requests:
+            self.cookie_audit.append(
+                {"host": netloc, "decision": "allow" if trusted else "deny"}
+            )
+        if trusted:
+            super().rebuild_cookies(
+                prepared_request, req, resp, yield_requests=yield_requests
+            )
+        else:
+            # Untrusted hop: remove any Cookie header and do not let the
+            # cookie jar replenish it. Response cookies are still extracted
+            # into the jar (preserving normal jar state), but no Cookie
+            # header is generated for this hop.
+            prepared_request.headers.pop("Cookie", None)
+            cookie_jar = cast("CookieJar", prepared_request._cookies)
+            extract_cookies_to_jar(cookie_jar, req, resp.raw)
+            merge_cookies(cookie_jar, self.cookies)
 
 
 def session() -> Session:
