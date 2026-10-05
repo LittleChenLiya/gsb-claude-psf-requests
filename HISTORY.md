@@ -5,6 +5,15 @@ dev
 ---
 
 - \[Short description of non-trivial change.\]
+- Added an exclusive raw-stream consumption session to `Response`: only one
+  consumer may iterate the raw stream at a time (a second iterator is
+  rejected while the first is active), finished/cancelled/failed iterations
+  leave the stream in a non-restartable `consumed` state, and `close()`
+  marks it `closed` after releasing the connection. Inspect the state via
+  `Response.stream_state` (`idle`/`active`/`consumed`/`closed`) or manage
+  it explicitly with `Response.acquire_stream()`/`release_stream()` and the
+  `Response.stream_session()` context manager. Whole-body reads (`content`,
+  `text`, `json`) follow the same occupancy check.
 
 
 2.34.2 (2026-05-14)

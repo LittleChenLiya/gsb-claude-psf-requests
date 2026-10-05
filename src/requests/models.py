@@ -14,6 +14,7 @@ import datetime
 # such as in Embedded Python. See https://github.com/psf/requests/issues/3578.
 import encodings.idna  # noqa: F401
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from io import UnsupportedOperation
 from typing import (
     TYPE_CHECKING,
@@ -749,6 +750,16 @@ class Response:
     request: PreparedRequest
     connection: HTTPAdapter
 
+    #: No consumer holds the raw stream; it may still be read from the start.
+    STREAM_IDLE: Final = "idle"
+    #: A consumer session exclusively holds the raw stream right now.
+    STREAM_ACTIVE: Final = "active"
+    #: The raw stream was (fully or partially) consumed and cannot be
+    #: re-read from the start.
+    STREAM_CONSUMED: Final = "consumed"
+    #: The response was closed and its connection released.
+    STREAM_CLOSED: Final = "closed"
+
     __attrs__: list[str] = [
         "_content",
         "status_code",
@@ -766,6 +777,13 @@ class Response:
         self._content = False
         self._content_consumed = False
         self._next = None
+
+        # Exclusive raw-stream consumption session tracking. Only one
+        # consumer may hold the raw stream at a time; see
+        # :attr:`stream_state`, :meth:`acquire_stream` and
+        # :meth:`stream_session`.
+        self._stream_state = self.STREAM_IDLE
+        self._stream_explicit = False
 
         #: Integer Code of responded HTTP Status, e.g. 404 or 200.
         self.status_code = None  # type: ignore[assignment]
@@ -829,6 +847,8 @@ class Response:
 
         # pickled objects do not have .raw
         setattr(self, "_content_consumed", True)
+        setattr(self, "_stream_state", self.STREAM_CONSUMED)
+        setattr(self, "_stream_explicit", False)
         setattr(self, "raw", None)
 
     def __repr__(self) -> str:
@@ -857,6 +877,110 @@ class Response:
     def __iter__(self) -> Iterator[bytes]:
         """Allows you to use a response as an iterator."""
         return self.iter_content(128)
+
+    @property
+    def stream_state(self) -> str:
+        """State of the exclusive raw-stream consumption session.
+
+        One of:
+
+        * ``"idle"`` (``Response.STREAM_IDLE``) -- no consumer holds the
+          raw stream; it may still be read from the start.
+        * ``"active"`` (``Response.STREAM_ACTIVE``) -- a consumer session
+          exclusively holds the raw stream; other consumers are rejected.
+        * ``"consumed"`` (``Response.STREAM_CONSUMED``) -- the raw stream
+          was fully or partially consumed (including by an aborted or
+          failed iteration) and cannot be re-read from the start.
+        * ``"closed"`` (``Response.STREAM_CLOSED``) -- :meth:`close` was
+          called and the underlying connection was released.
+        """
+        if self._stream_state == self.STREAM_IDLE and self._content_consumed:
+            return self.STREAM_CONSUMED
+        return self._stream_state
+
+    def _acquire_stream(self, explicit: bool = False) -> bool:
+        """Try to take the exclusive raw-stream consumption session.
+
+        Returns True when the caller acquired the session and must
+        release it, or False when the read is delegated by an already
+        active explicit session holder. Raises when the stream is busy,
+        consumed or closed.
+        """
+        state = self.stream_state
+        if state == self.STREAM_ACTIVE:
+            if self._stream_explicit and not explicit:
+                # The explicit session holder delegates this read.
+                return False
+            raise RuntimeError(
+                "The response stream is already being consumed by another "
+                "iterator; only one consumer may hold the raw stream at a "
+                "time."
+            )
+        if state != self.STREAM_IDLE:
+            raise StreamConsumedError(
+                f"The response stream is {state} and cannot be re-read from "
+                "the start."
+            )
+        self._stream_state = self.STREAM_ACTIVE
+        self._stream_explicit = explicit
+        return True
+
+    def acquire_stream(self) -> None:
+        """Explicitly acquire the exclusive raw-stream consumption session.
+
+        While the session is held, other consumers are rejected, while
+        the holder itself may iterate the response (e.g. via
+        :meth:`iter_content`). Pair every call with :meth:`release_stream`
+        or :meth:`close`; prefer the :meth:`stream_session` context
+        manager.
+        """
+        self._acquire_stream(explicit=True)
+
+    def release_stream(self) -> None:
+        """Release a session previously taken with :meth:`acquire_stream`.
+
+        If the stream was not consumed, it becomes readable from the
+        start again; otherwise it stays consumed.
+        """
+        if self._stream_state != self.STREAM_ACTIVE or not self._stream_explicit:
+            raise RuntimeError("No explicit stream consumption session is held.")
+        self._stream_explicit = False
+        if self.stream_state == self.STREAM_ACTIVE:
+            self._stream_state = (
+                self.STREAM_CONSUMED if self._content_consumed else self.STREAM_IDLE
+            )
+
+    @contextmanager
+    def stream_session(self) -> Iterator[Response]:
+        """Context manager holding the exclusive consumption session.
+
+        Inside the ``with`` block this response's raw stream is reserved
+        for the holder; the session is released on exit::
+
+            with r.stream_session():
+                for chunk in r.iter_content(8192):
+                    ...
+        """
+        self.acquire_stream()
+        try:
+            yield self
+        finally:
+            if (
+                self._stream_state == self.STREAM_ACTIVE
+                and self._stream_explicit
+            ):
+                self.release_stream()
+
+    def _finish_stream(self) -> None:
+        """Mark an in-progress raw-stream iteration as finished.
+
+        Whether the iteration completed, was cancelled or failed, the
+        raw stream is left at an unknown offset and must not be handed
+        to another consumer as if it were fresh.
+        """
+        if self._stream_state == self.STREAM_ACTIVE:
+            self._stream_state = self.STREAM_CONSUMED
+            self._stream_explicit = False
 
     @property
     def ok(self) -> bool:
@@ -933,27 +1057,37 @@ class Response:
         """
 
         def generate() -> Generator[bytes, None, None]:
-            # Special case for urllib3.
-            if hasattr(self.raw, "stream"):
-                try:
-                    yield from self.raw.stream(chunk_size, decode_content=True)
-                except ProtocolError as e:
-                    raise ChunkedEncodingError(e)
-                except DecodeError as e:
-                    raise ContentDecodingError(e)
-                except ReadTimeoutError as e:
-                    raise ConnectionError(e)
-                except SSLError as e:
-                    raise RequestsSSLError(e)
-            else:
-                # Standard file-like object.
-                while True:
-                    chunk = self.raw.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+            # Take the exclusive consumption session before touching the
+            # raw stream, so no second iterator can read it concurrently.
+            self._acquire_stream()
+            try:
+                # Special case for urllib3.
+                if hasattr(self.raw, "stream"):
+                    try:
+                        yield from self.raw.stream(chunk_size, decode_content=True)
+                    except ProtocolError as e:
+                        raise ChunkedEncodingError(e)
+                    except DecodeError as e:
+                        raise ContentDecodingError(e)
+                    except ReadTimeoutError as e:
+                        raise ConnectionError(e)
+                    except SSLError as e:
+                        raise RequestsSSLError(e)
+                else:
+                    # Standard file-like object.
+                    while True:
+                        chunk = self.raw.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
 
-            self._content_consumed = True
+                self._content_consumed = True
+            finally:
+                # On completion, cancellation (GeneratorExit) or error the
+                # raw stream is not restartable: mark it consumed instead
+                # of releasing it as unread. close() can still release the
+                # underlying connection afterwards.
+                self._finish_stream()
 
         if self._content_consumed and isinstance(self._content, bool):
             raise StreamConsumedError()
@@ -1182,3 +1316,8 @@ class Response:
         release_conn = getattr(self.raw, "release_conn", None)
         if release_conn is not None:
             release_conn()
+
+        # The connection is released; the raw stream is no longer readable
+        # and any consumption session is invalidated.
+        self._stream_state = self.STREAM_CLOSED
+        self._stream_explicit = False
