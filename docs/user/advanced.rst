@@ -667,6 +667,76 @@ You override this default certificate bundle by setting the ``REQUESTS_CA_BUNDLE
     >>> import requests
     >>> requests.get('https://example.org')
 
+.. _proxy_explainer:
+
+Explaining proxy selection
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 2.32.4
+
+When several layers of proxy configuration are present (request-level
+``proxies``, :attr:`Session.proxies <requests.Session.proxies>`, and
+environment variables), it can be hard to know which proxy a request will
+actually use.  :func:`requests.explain_proxy` answers this without sending a
+request and without modifying the process environment::
+
+    >>> import os
+    >>> os.environ['HTTP_PROXY'] = 'http://env-proxy:8080'
+    >>> from requests import Session
+    >>> session = Session()
+    >>> session.proxies = {'http': 'http://session-proxy:8080'}
+    >>> explanation = session.explain_proxy('http://example.com')
+    >>> print(explanation)
+    Proxy selection for http://example.com
+      Final proxy: http://env-proxy:8080 (from environment)
+      Proxy auth: not configured
+      Bypassed by no_proxy: no
+      no_proxy: not set
+      trust_env: yes
+      ...
+
+The explanation reports:
+
+* the final proxy URL (with any credentials redacted);
+* which layer provided it -- ``request``, ``session`` or ``environment``;
+* whether ``no_proxy`` excludes the target host (and from which layer the
+  ``no_proxy`` value came);
+* the effective merged proxy mapping and the per-layer mappings.
+
+Proxy credentials are never printed in plain text.  A proxy URL such as
+``http://user:secret@proxy:8080`` is rendered as ``http://***@proxy:8080``
+with ``proxy_auth`` set to ``True``::
+
+    >>> explanation = requests.explain_proxy(
+    ...     'http://example.com',
+    ...     proxies={'http': 'http://user:secret@proxy:8080'},
+    ... )
+    >>> explanation.proxy
+    'http://***@proxy:8080'
+    >>> explanation.proxy_auth
+    True
+
+An explicit empty mapping (``proxies={}``) is distinguished from a missing
+one (``proxies=None``); a missing layer never overrides session or
+environment configuration.
+
+The same information is available as JSON via
+:meth:`ProxyExplanation.to_dict <requests.proxy_explain.ProxyExplanation.to_dict>`.
+
+A command-line interface is also provided::
+
+    $ python -m requests.proxy_explain http://example.com
+    $ python -m requests.proxy_explain http://example.com --json
+    $ python -m requests.proxy_explain http://example.com --no-trust-env
+
+.. note::
+
+   The explainer mirrors the proxy resolution performed by
+   :meth:`Session.request <requests.Session.request>` (and the adapter's
+   :func:`~requests.utils.select_proxy`), so the reported selection matches
+   the one the real send path would make.  It is intentionally side-effect
+   free: no network request is sent and ``os.environ`` is never mutated.
+
 .. _socks:
 
 SOCKS

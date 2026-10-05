@@ -185,12 +185,34 @@ from .models import PreparedRequest, Request, Response
 from .sessions import Session, session
 from .status_codes import codes
 
+# Lazy-loaded attributes.  Importing them eagerly would put
+# ``requests.proxy_explain`` in ``sys.modules`` before ``python -m`` runs it
+# as ``__main__``, causing a spurious RuntimeWarning.
+_LAZY_IMPORTS = {
+    "explain_proxy": (".proxy_explain", "explain_proxy"),
+    "ProxyExplanation": (".proxy_explain", "ProxyExplanation"),
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_IMPORTS:
+        module_name, attr = _LAZY_IMPORTS[name]
+        from importlib import import_module
+
+        module = import_module(module_name, __name__)
+        value = getattr(module, attr)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = (
     "ConnectionError",
     "ConnectTimeout",
     "HTTPError",
     "JSONDecodeError",
     "PreparedRequest",
+    "ProxyExplanation",  # type: ignore[reportUnsupportedDunderAll]
     "ReadTimeout",
     "Request",
     "RequestException",
@@ -201,6 +223,7 @@ __all__ = (
     "URLRequired",
     "codes",
     "delete",
+    "explain_proxy",  # type: ignore[reportUnsupportedDunderAll]
     "get",
     "head",
     "options",

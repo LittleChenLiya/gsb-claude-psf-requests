@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 
     from . import _types as _t
     from .adapters import BaseAdapter
+    from .proxy_explain import ProxyExplanation
 
 # Preferred clock, based on which one is more accurate on a given system.
 if sys.platform == "win32":
@@ -866,6 +867,30 @@ class Session(SessionRedirectMixin):
         cert = merge_setting(cert, self.cert)
 
         return {"proxies": proxies, "stream": stream, "verify": verify, "cert": cert}
+
+    def explain_proxy(
+        self,
+        url: str,
+        proxies: dict[str, str] | None = None,
+    ) -> ProxyExplanation:
+        """Explain which proxy would be used for *url* without sending it.
+
+        This is a thin wrapper around
+        :func:`requests.proxy_explain.explain_proxy` that passes this
+        :class:`Session`'s ``proxies`` and ``trust_env``.  It mirrors the
+        proxy resolution of :meth:`request` (and the adapter's
+        :func:`~requests.utils.select_proxy`) but performs no network I/O and
+        never mutates the process environment.
+
+        :param url: The URL to explain proxy selection for.
+        :param proxies: Optional request-level proxies (as passed to
+            :meth:`request`).
+
+        :rtype: requests.proxy_explain.ProxyExplanation
+        """
+        from .proxy_explain import explain_proxy
+
+        return explain_proxy(url, proxies=proxies, session=self)
 
     def get_adapter(self, url: str) -> BaseAdapter:
         """
