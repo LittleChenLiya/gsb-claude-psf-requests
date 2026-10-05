@@ -44,6 +44,7 @@ from requests.exceptions import (
     ReadTimeout,
     RequestException,
     RetryError,
+    StreamConsumedError,
     Timeout,
     TooManyRedirects,
     UnrewindableBodyError,
@@ -1542,6 +1543,113 @@ class TestRequests:
 
         with pytest.raises(expected):
             next(r.iter_content(1024))
+
+    def test_iter_content_exclusive_session(self):
+        """Two iterators cannot read the same raw stream simultaneously.
+
+        When the first consumer reads a chunk, the second consumer must be
+        rejected. After the first finishes, the state is consumed rather than
+        restartable.
+        """
+        r = requests.Response()
+        r.raw = mock.Mock()
+        r.raw.stream.return_value = iter([b"chunk1", b"chunk2"])
+
+        it1 = r.iter_content(1024)
+        # First consumer acquires the session when it reads the first chunk.
+        assert next(it1) == b"chunk1"
+
+        # Second consumer must be rejected while the first is active.
+        it2 = r.iter_content(1024)
+        with pytest.raises(StreamConsumedError):
+            next(it2)
+
+        # After the first finishes, the state is consumed.
+        assert list(it1) == [b"chunk2"]
+        assert r._content_consumed is True
+        assert r._stream_active is False
+        with pytest.raises(StreamConsumedError):
+            next(r.iter_content(1024))
+
+    def test_iter_content_consumed_after_finish(self):
+        """After the stream is exhausted, the state is consumed, not restartable."""
+        r = requests.Response()
+        r.raw = mock.Mock()
+        r.raw.stream.return_value = iter([b"a", b"b", b"c"])
+
+        chunks = list(r.iter_content(1024))
+        assert chunks == [b"a", b"b", b"c"]
+        assert r._content_consumed is True
+        assert r._stream_active is False
+
+        # Cannot restart from the beginning.
+        with pytest.raises(StreamConsumedError):
+            list(r.iter_content(1024))
+
+    def test_iter_content_close_early_returns_connection(self):
+        """Closing the generator early releases the connection back to the pool."""
+        r = requests.Response()
+        r.raw = mock.Mock()
+        r.raw.stream.return_value = iter([b"a", b"b", b"c"])
+
+        it = r.iter_content(1024)
+        assert next(it) == b"a"
+        it.close()
+
+        assert r._content_consumed is True
+        assert r._stream_active is False
+        r.raw.close.assert_called_once()
+        r.raw.release_conn.assert_called_once()
+
+    def test_iter_content_exception_marks_consumed(self):
+        """An exception during iteration marks the state as consumed, not unconsumed."""
+        r = requests.Response()
+        r.raw = mock.Mock()
+        r.raw.stream.side_effect = urllib3.exceptions.ProtocolError("broken")
+
+        with pytest.raises(ChunkedEncodingError):
+            next(r.iter_content(1024))
+
+        assert r._content_consumed is True
+        assert r._stream_active is False
+        # Cannot pretend nothing happened and restart.
+        with pytest.raises(StreamConsumedError):
+            next(r.iter_content(1024))
+
+    def test_content_occupancy_check(self):
+        """text/json overall reads follow the occupancy check."""
+        r = requests.Response()
+        r.raw = mock.Mock()
+        r.raw.stream.return_value = iter([b"hello"])
+
+        it = r.iter_content(1024)
+        assert next(it) == b"hello"
+
+        # Accessing content while a stream is active raises StreamConsumedError.
+        with pytest.raises(StreamConsumedError):
+            r.content
+
+        # text and json propagate the same error.
+        with pytest.raises(StreamConsumedError):
+            r.text
+        with pytest.raises(StreamConsumedError):
+            r.json()
+
+    def test_close_active_stream_releases_connection(self):
+        """Calling close() while a stream is active releases the connection."""
+        r = requests.Response()
+        r.raw = mock.Mock()
+        r.raw.stream.return_value = iter([b"a", b"b", b"c"])
+
+        it = r.iter_content(1024)
+        assert next(it) == b"a"
+
+        r.close()
+
+        assert r._content_consumed is True
+        assert r._stream_active is False
+        r.raw.close.assert_called_once()
+        r.raw.release_conn.assert_called_once()
 
     def test_request_and_response_are_pickleable(self, httpbin):
         r = requests.get(httpbin("get"))

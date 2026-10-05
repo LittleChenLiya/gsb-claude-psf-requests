@@ -736,6 +736,7 @@ class Response:
 
     _content: bytes | Literal[False] | None
     _content_consumed: bool
+    _stream_active: bool
     _next: PreparedRequest | None
     status_code: int
     headers: CaseInsensitiveDict[str]
@@ -765,6 +766,7 @@ class Response:
     def __init__(self) -> None:
         self._content = False
         self._content_consumed = False
+        self._stream_active = False
         self._next = None
 
         #: Integer Code of responded HTTP Status, e.g. 404 or 200.
@@ -829,6 +831,7 @@ class Response:
 
         # pickled objects do not have .raw
         setattr(self, "_content_consumed", True)
+        setattr(self, "_stream_active", False)
         setattr(self, "raw", None)
 
     def __repr__(self) -> str:
@@ -933,27 +936,48 @@ class Response:
         """
 
         def generate() -> Generator[bytes, None, None]:
-            # Special case for urllib3.
-            if hasattr(self.raw, "stream"):
-                try:
-                    yield from self.raw.stream(chunk_size, decode_content=True)
-                except ProtocolError as e:
-                    raise ChunkedEncodingError(e)
-                except DecodeError as e:
-                    raise ContentDecodingError(e)
-                except ReadTimeoutError as e:
-                    raise ConnectionError(e)
-                except SSLError as e:
-                    raise RequestsSSLError(e)
-            else:
-                # Standard file-like object.
-                while True:
-                    chunk = self.raw.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+            # Acquire the exclusive consumption session. Only one iterator
+            # may read from the raw stream at a time. The session is released
+            # in the ``finally`` block when the generator is exhausted, closed,
+            # or garbage collected.
+            if self._stream_active:
+                raise StreamConsumedError()
+            self._stream_active = True
+            exhausted = False
 
-            self._content_consumed = True
+            try:
+                # Special case for urllib3.
+                if hasattr(self.raw, "stream"):
+                    try:
+                        yield from self.raw.stream(chunk_size, decode_content=True)
+                    except ProtocolError as e:
+                        raise ChunkedEncodingError(e)
+                    except DecodeError as e:
+                        raise ContentDecodingError(e)
+                    except ReadTimeoutError as e:
+                        raise ConnectionError(e)
+                    except SSLError as e:
+                        raise RequestsSSLError(e)
+                else:
+                    # Standard file-like object.
+                    while True:
+                        chunk = self.raw.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+                exhausted = True
+            finally:
+                self._stream_active = False
+                if not self._content_consumed:
+                    self._content_consumed = True
+                    if not exhausted:
+                        # The stream was closed before it was fully consumed
+                        # (e.g. the generator was closed early or an exception
+                        # occurred). Release the connection back to the pool.
+                        self.raw.close()
+                        release_conn = getattr(self.raw, "release_conn", None)
+                        if release_conn is not None:
+                            release_conn()
 
         if self._content_consumed and isinstance(self._content, bool):
             raise StreamConsumedError()
@@ -1034,6 +1058,9 @@ class Response:
     @property
     def content(self) -> bytes:
         """Content of the response, in bytes."""
+
+        if self._stream_active:
+            raise StreamConsumedError()
 
         if self._content is False:
             # Read the contents.
@@ -1176,9 +1203,22 @@ class Response:
 
         *Note: Should not normally need to be called explicitly.*
         """
-        if not self._content_consumed:
+        if self._stream_active:
+            # An iterator is currently reading from the raw stream. Mark the
+            # session as ended and the content as consumed, then release the
+            # connection. The generator's ``finally`` block will be a no-op
+            # when it runs (the state is already final), so the connection is
+            # not released twice.
+            self._stream_active = False
+            self._content_consumed = True
             self.raw.close()
+            release_conn = getattr(self.raw, "release_conn", None)
+            if release_conn is not None:
+                release_conn()
+        else:
+            if not self._content_consumed:
+                self.raw.close()
 
-        release_conn = getattr(self.raw, "release_conn", None)
-        if release_conn is not None:
-            release_conn()
+            release_conn = getattr(self.raw, "release_conn", None)
+            if release_conn is not None:
+                release_conn()
