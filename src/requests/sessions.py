@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 
     from . import _types as _t
     from .adapters import BaseAdapter
+    from .explain import ProxyExplanation
 
 # Preferred clock, based on which one is more accurate on a given system.
 if sys.platform == "win32":
@@ -866,6 +867,39 @@ class Session(SessionRedirectMixin):
         cert = merge_setting(cert, self.cert)
 
         return {"proxies": proxies, "stream": stream, "verify": verify, "cert": cert}
+
+    def explain_proxies(
+        self,
+        url: str,
+        proxies: dict[str, str] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> ProxyExplanation:
+        """Explain which proxy this session would use for ``url``, and why.
+
+        This resolves the exact same layers as the send path (per-request
+        ``proxies``, :attr:`Session.proxies` and the environment, honoring
+        :attr:`Session.trust_env` and ``no_proxy``) but sends no request and
+        never modifies the process environment. Proxy credentials are
+        reported as configured but their values are hidden.
+
+        :param url: The URL a request would be sent to.
+        :param proxies: Optional per-request proxies mapping, as would be
+            passed to :meth:`request`. ``None`` (missing) is distinguished
+            from an explicitly empty mapping.
+        :param env: Optional environment mapping to explain against instead of
+            the real ``os.environ`` (which is only ever read, never modified).
+        :rtype: requests.explain.ProxyExplanation
+        """
+        # Imported lazily so that ``python -m requests.explain`` stays clean.
+        from .explain import explain_proxy_selection
+
+        return explain_proxy_selection(
+            url,
+            request_proxies=proxies,
+            session_proxies=self.proxies,
+            trust_env=self.trust_env,
+            env=env,
+        )
 
     def get_adapter(self, url: str) -> BaseAdapter:
         """

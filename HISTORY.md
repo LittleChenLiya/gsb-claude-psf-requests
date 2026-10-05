@@ -6,6 +6,14 @@ dev
 
 - \[Short description of non-trivial change.\]
 
+- Added an explicit proxy-selection explainer: `requests.explain_proxies()`
+  and `Session.explain_proxies()` report which layer (request, session or
+  environment) the final proxy for a URL comes from, whether `no_proxy`
+  bypasses it, and whether proxy authentication is configured (credentials
+  are always redacted). The explanation sends no request and never modifies
+  the process environment; an optional `env` mapping allows explaining
+  hypothetical environments.
+
 
 2.34.2 (2026-05-14)
 -------------------

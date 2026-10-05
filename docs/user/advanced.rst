@@ -667,6 +667,81 @@ You override this default certificate bundle by setting the ``REQUESTS_CA_BUNDLE
     >>> import requests
     >>> requests.get('https://example.org')
 
+Explaining Proxy Selection
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When proxies are configured in several places at once (per-request, on the
+session, and in the environment), it can be hard to tell which one will
+actually be used. The proxy-selection explainer answers that question
+*without sending any request* and without modifying the process
+environment, not even temporarily::
+
+    >>> import requests
+    >>> session = requests.Session()
+    >>> session.proxies["http"] = "http://10.10.1.10:3128"
+    >>> print(session.explain_proxies("http://example.org/"))
+    Proxy selection for 'http://example.org/' (explanation only; no request was sent)
+      trust_env: True
+      request: not provided
+      session: http=http://10.10.1.10:3128
+      environment: not provided
+    Result: proxy http://10.10.1.10:3128 (from session, key 'http')
+
+The explanation reports which layer the final proxy comes from
+(``request``, ``session`` or ``environment``), which proxies-mapping key
+matched, and whether a ``no_proxy`` rule bypassed proxying entirely::
+
+    >>> import os
+    >>> os.environ["http_proxy"] = "http://10.10.1.10:3128"
+    >>> os.environ["no_proxy"] = "localhost,127.0.0.1"
+    >>> explanation = requests.Session().explain_proxies("http://127.0.0.1:8080/")
+    >>> explanation.direct
+    True
+    >>> explanation.bypassed, explanation.bypass_match
+    (True, '127.0.0.1')
+
+Note that ``no_proxy`` only strips proxies coming from the environment; a
+proxy set explicitly on the request or the session still applies.
+
+A missing layer is distinguished from an explicitly empty one, and a key
+explicitly set to ``None`` (which clears lower layers) is called out.
+Proxy credentials are never exposed: the explanation only notes that
+authentication is configured and redacts the values::
+
+    >>> explanation = requests.explain_proxies(
+    ...     "http://example.org/",
+    ...     proxies={"http": "http://user:password@10.10.1.10:3128"},
+    ... )
+    >>> explanation.final_proxy
+    'http://***:***@10.10.1.10:3128'
+    >>> explanation.auth_configured
+    True
+
+To ask "what if" questions against a hypothetical environment, pass a
+mapping via the ``env`` parameter; the real ``os.environ`` is then left
+completely untouched::
+
+    >>> explanation = requests.explain_proxies(
+    ...     "https://example.org/",
+    ...     env={"https_proxy": "http://10.10.1.10:1080"},
+    ... )
+    >>> explanation.source
+    'environment'
+
+The selection reported always matches what the :class:`Session
+<requests.Session>` send path would actually use.
+
+The explainer is also available as a command, which explains the proxy
+selection for a URL against the current environment::
+
+    $ python -m requests.explain http://example.org/
+    Proxy selection for 'http://example.org/' (explanation only; no request was sent)
+      trust_env: True
+      request: not provided
+      session: not provided
+      environment: http=http://10.10.1.10:3128
+    Result: proxy http://10.10.1.10:3128 (from environment, key 'http')
+
 .. _socks:
 
 SOCKS

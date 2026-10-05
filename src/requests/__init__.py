@@ -185,12 +185,25 @@ from .models import PreparedRequest, Request, Response
 from .sessions import Session, session
 from .status_codes import codes
 
+
+def __getattr__(name):
+    # Lazily expose the proxy-selection explainer so that running
+    # ``python -m requests.explain`` does not trip over an already-imported
+    # ``requests.explain`` module.
+    if name in ("ProxyExplanation", "explain_proxies"):
+        from . import explain
+
+        return getattr(explain, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = (
     "ConnectionError",
     "ConnectTimeout",
     "HTTPError",
     "JSONDecodeError",
     "PreparedRequest",
+    "ProxyExplanation",
     "ReadTimeout",
     "Request",
     "RequestException",
@@ -201,6 +214,7 @@ __all__ = (
     "URLRequired",
     "codes",
     "delete",
+    "explain_proxies",
     "get",
     "head",
     "options",
